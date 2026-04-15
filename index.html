@@ -1,6 +1,12 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <link rel="manifest" href="manifest.json">
+  
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Daily Cashier Log</title>
@@ -295,7 +301,8 @@ const CAT_LABELS = {
   normal:'Normal', small:'Small', xsmall:'X-Small',
   alkaline:'Alkaline', alkaline_small:'Alk. Small',
   refill:'Refill', new_gallon:'New Gallon',
-  ml350:'350ml', ml500:'500ml', ml1000:'1000ml'
+  ml350:'350ml', ml500:'500ml', ml1000:'1000ml',
+  track_unioil:'Tracking UniOil', track_tbs:'Tracking TBS'
 };
 const PICKUP_PRICES = {
   normal:{type:'fixed',val:30}, xsmall:{type:'fixed',val:12},
@@ -311,14 +318,17 @@ const DELIVERY_PRICES = {
   refill:{type:'fixed',val:5}, ml350:{type:'fixed',val:10},
   ml500:{type:'fixed',val:15}, ml1000:{type:'fixed',val:20},
   small:{type:'fixed',val:20},
-  new_gallon:{type:'options',opts:[{label:'Gallon only',val:205},{label:'+ Water',val:225},{label:'+ Water+Delivery',val:235}]}
+  new_gallon:{type:'options',opts:[{label:'Gallon only',val:205},{label:'+ Water',val:225},{label:'+ Water+Delivery',val:235}]},
+  track_unioil:{type:'fixed',val:40},
+  track_tbs:{type:'fixed',val:40}
 };
 const DELIVERY_COMMISSION = {
   normal:5, small:3, xsmall:3, alkaline:5, alkaline_small:5,
-  refill:0, new_gallon:5, ml350:0, ml500:0, ml1000:0
+  refill:0, new_gallon:5, ml350:0, ml500:0, ml1000:0,
+  track_unioil:10, track_tbs:10
 };
 const PICKUP_CATS   = ['normal','small','xsmall','alkaline','alkaline_small','refill','new_gallon','ml350','ml500','ml1000'];
-const DELIVERY_CATS = ['normal','small','xsmall','alkaline','alkaline_small','refill','new_gallon'];
+const DELIVERY_CATS = ['normal','small','xsmall','alkaline','alkaline_small','refill','new_gallon','track_unioil','track_tbs'];
 
 // ── STATE ─────────────────────────────────────────────────────────────────────
 const DASHBOARD_ID = '__dashboard__';
@@ -348,19 +358,20 @@ function setSyncStatus(state, text) {
 }
 
 // ── FIRESTORE HELPERS ─────────────────────────────────────────────────────────
+// Debounce: batches all rapid saves into 1 Firestore write after 3s of inactivity
+let _saveTimer = null;
+
 async function loadFromFirestore(dateKey) {
   setSyncStatus('syncing', 'Loading...');
   try {
     const ref  = doc(db, 'daily_logs', dateKey);
     const snap = await getDoc(ref);
     if (snap.exists()) {
-      const data = snap.data();
       setSyncStatus('synced', 'Synced');
-      return data.sections || [];
-    } else {
-      setSyncStatus('synced', 'Synced');
-      return null;
+      return snap.data().sections || [];
     }
+    setSyncStatus('synced', 'Synced');
+    return null;
   } catch(e) {
     console.error(e);
     setSyncStatus('error', 'Offline');
@@ -368,13 +379,33 @@ async function loadFromFirestore(dateKey) {
   }
 }
 
-async function saveToFirestore() {
+// Minimal payload: only the fields that matter, no metadata bloat
+async function flushToFirestore() {
   setSyncStatus('syncing', 'Saving...');
   try {
-    const ref = doc(db, 'daily_logs', TODAY);
-    await setDoc(ref, { sections, updatedAt: new Date().toISOString(), dateKey: TODAY });
+    const payload = sections.map(s => ({
+      id: s.id, name: s.name, type: s.type,
+      entries: s.entries.map(e => ({
+        id: e.id, name: e.name, cat: e.cat,
+        qty: e.qty, price: e.price, total: e.total,
+        commission: e.commission || 0, payment: e.payment
+      }))
+    }));
+    await setDoc(doc(db, 'daily_logs', TODAY), { sections: payload, dateKey: TODAY });
+
+    // Also write a tiny summary index (no entries) so Records list loads fast
+    const summary = payload.map(s => {
+      const paid = s.entries.filter(e => e.payment === 'Paid');
+      return {
+        id: s.id, name: s.name, type: s.type,
+        totalSales: paid.reduce((a,e) => a + e.total, 0),
+        totalComm:  paid.reduce((a,e) => a + (e.commission||0), 0),
+        entryCount: paid.length
+      };
+    });
+    await setDoc(doc(db, 'daily_index', TODAY), { dateKey: TODAY, summary });
+
     setSyncStatus('synced', 'Saved ✓');
-    // briefly show then revert
     setTimeout(() => setSyncStatus('synced', 'Synced'), 2000);
   } catch(e) {
     console.error(e);
@@ -382,17 +413,24 @@ async function saveToFirestore() {
   }
 }
 
+// Debounced save — replaces all direct saveToFirestore() calls
+function scheduleFirestoreSave() {
+  setSyncStatus('syncing', 'Pending...');
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(flushToFirestore, 3000);
+}
+
+// Records list loads from lightweight index — never downloads entries just for the list
 async function loadPastDates() {
   try {
-    const col  = collection(db, 'daily_logs');
+    const col  = collection(db, 'daily_index');
     const q    = query(col, orderBy('dateKey', 'desc'));
     const snap = await getDocs(q);
     const dates = [];
     snap.forEach(d => {
       const data = d.data();
-      if (data.dateKey && data.dateKey !== TODAY) {
-        dates.push({ dateKey: data.dateKey, sections: data.sections || [], updatedAt: data.updatedAt });
-      }
+      if (data.dateKey && data.dateKey !== TODAY)
+        dates.push(data);
     });
     return dates;
   } catch(e) {
@@ -433,7 +471,7 @@ async function init() {
 
 function save() {
   localStorage.setItem('cashier_sections_v3', JSON.stringify(sections));
-  saveToFirestore();
+  scheduleFirestoreSave();
 }
 
 function getSec(id)  { return sections.find(s=>s.id===(id||activeSec)); }
@@ -545,12 +583,14 @@ async function renderRecords() {
     return;
   }
 
+  // Use pre-computed summary — no entries downloaded, instant render
   list.innerHTML = dates.map(d => {
-    const paid   = (d.sections||[]).flatMap(s=>s.entries||[]).filter(e=>e.payment==='Paid');
-    const total  = paid.reduce((s,e)=>s+e.total,0);
-    const comm   = paid.reduce((s,e)=>s+(e.commission||0),0);
+    const sum    = d.summary || [];
+    const total  = sum.reduce((a,s) => a + (s.totalSales||0), 0);
+    const comm   = sum.reduce((a,s) => a + (s.totalComm||0), 0);
     const net    = total - comm;
-    const secNames = (d.sections||[]).map(s=>s.name).join(', ');
+    const count  = sum.reduce((a,s) => a + (s.entryCount||0), 0);
+    const secNames = sum.map(s => s.name).join(', ');
     const label  = formatDateKey(d.dateKey);
     return `<div class="record-item" onclick="openPastDate('${d.dateKey}')">
       <div>
@@ -559,7 +599,7 @@ async function renderRecords() {
       </div>
       <div class="record-meta">
         <div class="record-total">₱${net.toFixed(2)}</div>
-        <div class="record-sections">${paid.length} paid entr${paid.length!==1?'ies':'y'}</div>
+        <div class="record-sections">${count} paid entr${count!==1?'ies':'y'}</div>
       </div>
       <div class="record-arrow">›</div>
     </div>`;
@@ -1077,7 +1117,13 @@ window.confirmAddSection=confirmAddSection; window.switchSection=switchSection;
 window.openPastDate=openPastDate;
 
 // ── START ─────────────────────────────────────────────────────────────────────
+// Flush any pending debounced save when user closes/navigates away
+window.addEventListener('beforeunload', () => {
+  if (_saveTimer) { clearTimeout(_saveTimer); flushToFirestore(); }
+});
+
 init();
 </script>
 </body>
 </html>
+
