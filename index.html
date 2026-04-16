@@ -227,7 +227,10 @@ tr.special-row td:nth-child(3){color:var(--warn)!important;}
       <div class="field"><label>Quantity</label><input type="number" id="eQty" min="1" oninput="calcEditTotal()"></div>
       <div class="field">
         <label>Price per unit</label>
-        <div id="eChips" class="price-chips"></div>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+          <div id="eChips" class="price-chips" style="flex:1;min-width:0;"></div>
+          <button type="button" title="Enter custom price" onclick="enableEditCustomPrice()" style="padding:5px 9px;font-size:0.72rem;border-radius:6px;border:1px solid var(--warn);background:transparent;color:var(--warn);font-family:'DM Mono',monospace;cursor:pointer;white-space:nowrap;flex-shrink:0;">✏ Custom</button>
+        </div>
         <input type="number" id="ePrice" min="0" style="margin-top:8px;" oninput="calcEditTotal()">
       </div>
       <div class="field">
@@ -381,6 +384,8 @@ function save() {
   setSyncStatus('syncing','Pending...');
   clearTimeout(_saveTimer);
   _saveTimer = setTimeout(flushToFirestore, 2000);
+  // Keep dashboard in sync if currently viewing it
+  if(activeSec===DASHBOARD_ID)renderDashboard();
 }
 
 async function flushToFirestore() {
@@ -482,39 +487,40 @@ async function init() {
     sections=[{id:'pickup',name:'Pick Up',type:'pickup',entries:[]}];
 
   // ── DAY-CHANGE: carry unpaid entries forward ────────────────────────────────
-  // If any entry has a dateCreated from a PREVIOUS day and is still Unpaid,
-  // it should stay visible today. Paid entries from previous days get cleared.
   const lastKnownDay = localStorage.getItem('cashier_last_day');
   if (lastKnownDay && lastKnownDay !== TODAY) {
-    // A new day has started — archive yesterday to Firestore under the old key,
-    // then keep only unpaid entries (marked as carriedOver) for today.
-    try {
-      const payload = sections.map(s=>({
-        id:s.id,name:s.name,type:s.type,
-        entries:s.entries.map(e=>({
-          id:e.id,name:e.name,cat:e.cat,qty:e.qty,price:e.price,
-          total:e.total,commission:e.commission||0,payment:e.payment,
-          dateCreated:e.dateCreated||lastKnownDay,carriedOver:e.carriedOver||false
-        }))
-      }));
-      await setDoc(doc(db,'daily_logs',lastKnownDay),{sections:payload,dateKey:lastKnownDay});
-      const summary=payload.map(s=>{
-        const paid=s.entries.filter(e=>e.payment==='Paid');
-        return{id:s.id,name:s.name,type:s.type,
-          totalSales:paid.reduce((a,e)=>a+e.total,0),
-          totalComm:paid.reduce((a,e)=>a+(e.commission||0),0),
-          entryCount:paid.length};
-      });
-      await setDoc(doc(db,'daily_index',lastKnownDay),{dateKey:lastKnownDay,summary});
-    } catch(err){console.warn('Carryover archive failed:',err);}
-
-    // Keep only unpaid entries, flag them as carried over
+    // Keep only unpaid entries, flag them as carried over — do this FIRST so UI is instant
     sections.forEach(s=>{
       s.entries = s.entries
         .filter(e=>e.payment!=='Paid')
         .map(e=>({...e, carriedOver:true}));
     });
-    save();
+    localStorage.setItem('cashier_sections_v3', JSON.stringify(sections));
+    // Archive yesterday to Firestore in the background — non-blocking
+    (async()=>{
+      try {
+        const payload = sections.map(s=>({
+          id:s.id,name:s.name,type:s.type,
+          entries:s.entries.map(e=>({
+            id:e.id,name:e.name,cat:e.cat,qty:e.qty,price:e.price,
+            total:e.total,commission:e.commission||0,payment:e.payment,
+            dateCreated:e.dateCreated||lastKnownDay,carriedOver:e.carriedOver||false
+          }))
+        }));
+        // Archive the PREVIOUS day's full data (load it fresh from storage snapshot)
+        const prevSnap=await getDoc(doc(db,'daily_logs',lastKnownDay)).catch(()=>null);
+        const archivePayload=prevSnap&&prevSnap.exists()?prevSnap.data().sections:payload;
+        await setDoc(doc(db,'daily_logs',lastKnownDay),{sections:archivePayload,dateKey:lastKnownDay});
+        const summary=(archivePayload||[]).map(s=>{
+          const paid=(s.entries||[]).filter(e=>e.payment==='Paid');
+          return{id:s.id,name:s.name,type:s.type,
+            totalSales:paid.reduce((a,e)=>a+e.total,0),
+            totalComm:paid.reduce((a,e)=>a+(e.commission||0),0),
+            entryCount:paid.length};
+        });
+        await setDoc(doc(db,'daily_index',lastKnownDay),{dateKey:lastKnownDay,summary});
+      } catch(err){console.warn('Carryover archive failed:',err);}
+    })();
   }
   localStorage.setItem('cashier_last_day', TODAY);
   // ── END DAY-CHANGE ──────────────────────────────────────────────────────────
@@ -697,45 +703,54 @@ function renderPastDateView(){
 // ── DASHBOARD ─────────────────────────────────────────────────────────────────
 function calcSecStats(sec){
   const paid=(sec.entries||[]).filter(e=>e.payment==='Paid');
+  const unpaidEntries=(sec.entries||[]).filter(e=>e.payment!=='Paid');
   const totalGals =paid.reduce((s,e)=>s+e.qty,0);
   const totalSales=paid.reduce((s,e)=>s+e.total,0);
   const totalComm =sec.type==='delivery'?paid.reduce((s,e)=>s+(e.commission||0),0):0;
-  return{totalGals,totalSales,totalComm,overall:totalSales-totalComm,entryCount:(sec.entries||[]).length};
+  const unpaidAmt =unpaidEntries.reduce((s,e)=>s+e.total,0);
+  const unpaidComm=sec.type==='delivery'?unpaidEntries.reduce((s,e)=>s+(e.commission||0),0):0;
+  const unpaidGals=unpaidEntries.reduce((s,e)=>s+e.qty,0);
+  return{totalGals,totalSales,totalComm,overall:totalSales-totalComm,entryCount:(sec.entries||[]).length,paidCount:paid.length,unpaidCount:unpaidEntries.length,unpaidAmt,unpaidComm,unpaidGals};
 }
 
 function renderDashboard(){
-  let gGals=0,gSales=0,gComm=0;
+  let gGals=0,gSales=0,gComm=0,gUnpaid=0,gUnpaidComm=0;
   const secStats=sections.map(sec=>{
-    const s=calcSecStats(sec);gGals+=s.totalGals;gSales+=s.totalSales;gComm+=s.totalComm;
+    const s=calcSecStats(sec);gGals+=s.totalGals;gSales+=s.totalSales;gComm+=s.totalComm;gUnpaid+=s.unpaidAmt;gUnpaidComm+=s.unpaidComm;
     return{sec,stats:s};
   });
   const gOverall=gSales-gComm;
   const cards=secStats.map(({sec,stats})=>{
     const isDel=sec.type==='delivery';
+    const countDisp=stats.unpaidCount>0
+      ?`<span style="color:var(--paid)">${stats.paidCount}</span>+<span style="color:var(--unpaid)">${stats.unpaidCount}</span>`
+      :`${stats.paidCount}`;
     return`<div class="dash-sec-card">
       <div class="dash-sec-header">
         <div><span class="dash-sec-name ${isDel?'delivery-color':'pickup-color'}" style="font-family:'Syne',sans-serif;font-size:0.9rem;font-weight:700">${esc(sec.name)}</span><span class="type-badge ${sec.type}">${sec.type}</span></div>
-        <div class="dash-sec-entries">${stats.entryCount} entr${stats.entryCount!==1?'ies':'y'}</div>
+        <div class="dash-sec-entries">${countDisp} entr${stats.entryCount!==1?'ies':'y'}</div>
       </div>
       <div class="dash-sec-body">
-        <div class="dash-metric"><div class="dash-metric-label">Gallons</div><div class="dash-metric-val m-gal${stats.totalGals===0?' dash-zero':''}">${stats.totalGals}</div></div>
+        <div class="dash-metric"><div class="dash-metric-label">Gallons</div><div class="dash-metric-val m-gal${stats.totalGals===0?' dash-zero':''}">${stats.totalGals}${stats.unpaidGals>0?`<span style="font-size:0.65rem;color:var(--unpaid)">+${stats.unpaidGals}</span>`:''}</div></div>
         <div class="dash-metric"><div class="dash-metric-label">Sales</div><div class="dash-metric-val m-sales${stats.totalSales===0?' dash-zero':''}">₱${stats.totalSales.toFixed(2)}</div></div>
-        <div class="dash-metric"><div class="dash-metric-label">Commission</div><div class="dash-metric-val m-comm${stats.totalComm===0?' dash-zero':''}">₱${stats.totalComm.toFixed(2)}</div></div>
+        <div class="dash-metric"><div class="dash-metric-label">Commission</div><div class="dash-metric-val m-comm${stats.totalComm===0?' dash-zero':''}">₱${stats.totalComm.toFixed(2)}${isDel&&stats.unpaidComm>0?`<div style="font-size:0.6rem;color:var(--unpaid)">+₱${stats.unpaidComm.toFixed(2)} unpaid</div>`:''}</div></div>
         <div class="dash-metric"><div class="dash-metric-label">Overall</div><div class="dash-metric-val m-overall${stats.overall===0?' dash-zero':''}">₱${stats.overall.toFixed(2)}</div></div>
       </div>
+      ${stats.unpaidAmt>0?`<div style="padding:6px 16px 10px;font-size:0.68rem;color:var(--unpaid)">Unpaid: ₱${stats.unpaidAmt.toFixed(2)}${isDel&&stats.unpaidComm>0?' · Comm: ₱'+stats.unpaidComm.toFixed(2):''}</div>`:''}
     </div>`;
   }).join('');
 
   document.getElementById('sectionContent').innerHTML=`
     <div class="dash-hero">
       <div class="dash-hero-title">📊 Summary Board</div>
-      <div class="dash-hero-sub">Today · All sections · Paid only · Live</div>
+      <div class="dash-hero-sub">Today · All sections · Live</div>
       <div class="dash-kpi-row">
         <div class="dash-kpi"><div class="dash-kpi-label">Total Gallons</div><div class="dash-kpi-val white">${gGals}</div></div>
-        <div class="dash-kpi"><div class="dash-kpi-label">Total Sales</div><div class="dash-kpi-val green">₱${gSales.toFixed(2)}</div></div>
+        <div class="dash-kpi"><div class="dash-kpi-label">Total Sales</div><div class="dash-kpi-val green" style="font-size:clamp(1rem,3vw,1.5rem)">₱${gSales.toFixed(2)}</div></div>
         <div class="dash-kpi"><div class="dash-kpi-label">Commission</div><div class="dash-kpi-val purple">₱${gComm.toFixed(2)}</div></div>
-        <div class="dash-kpi"><div class="dash-kpi-label">Net Overall</div><div class="dash-kpi-val blue">₱${gOverall.toFixed(2)}</div></div>
+        <div class="dash-kpi"><div class="dash-kpi-label">Net Overall</div><div class="dash-kpi-val blue" style="font-size:clamp(1rem,3vw,1.5rem)">₱${gOverall.toFixed(2)}</div></div>
       </div>
+      ${gUnpaid>0?`<div style="margin-top:10px;padding:8px 12px;background:rgba(248,113,113,0.08);border:1px solid rgba(248,113,113,0.25);border-radius:8px;font-size:0.72rem;color:var(--unpaid)">Unpaid Total: <strong>₱${gUnpaid.toFixed(2)}</strong>${gUnpaidComm>0?' · Unpaid Commission: <strong>₱'+gUnpaidComm.toFixed(2)+'</strong>':''}</div>`:''}
     </div>
     <div class="dash-sections-title">Per-Section Breakdown</div>
     <div class="dash-section-cards">${cards}</div>
@@ -743,10 +758,14 @@ function renderDashboard(){
       <div class="dash-grand-title">🧮 Grand Total</div>
       <div class="dash-grand-grid">
         <div class="dash-grand-item"><div class="dg-label">Total Gallons</div><div class="dg-val medium" style="color:var(--text)">${gGals}</div></div>
-        <div class="dash-grand-item"><div class="dg-label">Total Sales</div><div class="dg-val medium" style="color:var(--accent)">₱${gSales.toFixed(2)}</div></div>
+        <div class="dash-grand-item"><div class="dg-label">Total Sales</div><div class="dg-val medium" style="color:var(--accent);font-size:clamp(0.9rem,3vw,1.3rem)">₱${gSales.toFixed(2)}</div></div>
         <div class="dash-grand-item"><div class="dg-label">Total Commission</div><div class="dg-val medium" style="color:var(--commission)">₱${gComm.toFixed(2)}</div></div>
-        <div class="dash-grand-item" style="background:rgba(0,212,170,0.08);border:1px solid rgba(0,212,170,0.2)"><div class="dg-label">Final Overall</div><div class="dg-val large">₱${gOverall.toFixed(2)}</div></div>
+        <div class="dash-grand-item" style="background:rgba(0,212,170,0.08);border:1px solid rgba(0,212,170,0.2)"><div class="dg-label">Final Overall</div><div class="dg-val large" style="font-size:clamp(0.9rem,3vw,1.3rem)">₱${gOverall.toFixed(2)}</div></div>
       </div>
+      ${gUnpaid>0?`<div style="margin-top:12px;padding:10px 14px;background:rgba(248,113,113,0.08);border:1px solid rgba(248,113,113,0.25);border-radius:10px;display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:6px;">
+        <div><span style="font-size:0.62rem;color:var(--unpaid);text-transform:uppercase;letter-spacing:1px;display:block;">Overall Unpaid</span>${gUnpaidComm>0?`<span style="font-size:0.68rem;color:var(--commission)">Commission: ₱${gUnpaidComm.toFixed(2)}</span>`:''}</div>
+        <span style="font-family:'Syne',sans-serif;font-size:1.1rem;font-weight:800;color:var(--unpaid)">₱${gUnpaid.toFixed(2)}</span>
+      </div>`:''}
       <div class="dash-export-row"><button class="btn-dash-export" onclick="exportDashboardCSV()">⬇ Export Today CSV</button></div>
       <div class="dash-updated">Updated: ${new Date().toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'})}</div>
     </div>`;
@@ -765,11 +784,17 @@ function renderSection(){
       <div style="font-family:'Syne',sans-serif;font-size:0.82rem;font-weight:700;color:var(--muted);margin-bottom:12px;">${esc(sec.name)} <span class="type-badge ${sec.type}">${sec.type}</span></div>
       <div class="form-grid">
         <div class="field" style="grid-column:span 2;"><label>Customer Name</label>
-          <div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:5px;">
-            <button type="button" class="chip" onclick="document.getElementById('custName').value='Blue'">Blue</button>
-            <button type="button" class="chip" onclick="document.getElementById('custName').value='Cream'">Cream</button>
-            <button type="button" class="chip" onclick="document.getElementById('custName').value='Bilog'">Bilog</button>
-            <button type="button" class="chip" onclick="document.getElementById('custName').value='Batch'">Batch</button>
+          <div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:5px;align-items:center;">
+            <button type="button" class="chip" onclick="document.getElementById('custName').value='Blue';document.getElementById('othersSubOpts').style.display='none'">Blue</button>
+            <button type="button" class="chip" onclick="document.getElementById('custName').value='Cream';document.getElementById('othersSubOpts').style.display='none'">Cream</button>
+            <button type="button" class="chip" onclick="document.getElementById('custName').value='Bilog';document.getElementById('othersSubOpts').style.display='none'">Bilog</button>
+            <button type="button" class="chip" onclick="document.getElementById('custName').value='Batch';document.getElementById('othersSubOpts').style.display='none'">Batch</button>
+            <button type="button" class="chip" id="othersChip" onclick="toggleOthersChip(this)">Others</button>
+          </div>
+          <div id="othersSubOpts" style="display:none;flex-wrap:wrap;gap:5px;margin-bottom:5px;">
+            <button type="button" class="chip" style="border-color:var(--accent2);color:var(--accent2);" onclick="document.getElementById('custName').value='Small';setOthersSubActive(this)">Small</button>
+            <button type="button" class="chip" style="border-color:var(--accent2);color:var(--accent2);" onclick="document.getElementById('custName').value='Xsmall';setOthersSubActive(this)">Xsmall</button>
+            <button type="button" class="chip" style="border-color:var(--accent2);color:var(--accent2);" onclick="document.getElementById('custName').value='Refill';setOthersSubActive(this)">Refill</button>
           </div>
           <input type="text" id="custName" placeholder="Enter name or pick above..." autocomplete="off">
         </div>
@@ -778,7 +803,10 @@ function renderSection(){
       </div>
       <div class="field" style="margin-bottom:12px;">
         <label>Price per unit</label>
-        <div id="priceChips" class="price-chips"></div>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+          <div id="priceChips" class="price-chips" style="flex:1;min-width:0;"></div>
+          <button type="button" id="customPriceBtn" title="Enter custom price" onclick="enableCustomPrice()" style="padding:5px 9px;font-size:0.72rem;border-radius:6px;border:1px solid var(--warn);background:transparent;color:var(--warn);font-family:'DM Mono',monospace;cursor:pointer;white-space:nowrap;flex-shrink:0;">✏ Custom</button>
+        </div>
         <input type="number" id="price" placeholder="0" min="0" style="margin-top:8px;" oninput="calcTotal()">
       </div>
       <div class="field" style="margin-bottom:12px;">
@@ -795,7 +823,10 @@ function renderSection(){
     <div class="table-card">
       <div class="table-header-bar">
         <div class="section-title">Entries — ${esc(sec.name)}</div>
-        <button class="btn-export" onclick="exportCSV()">⬇ Export CSV</button>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <input type="text" id="searchBar" placeholder="🔍 Search name..." autocomplete="off" oninput="filterTable()" style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:'DM Mono',monospace;font-size:0.78rem;padding:6px 10px;outline:none;width:150px;transition:border-color 0.2s;" onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'">
+          <button class="btn-export" onclick="exportCSV()">⬇ Export CSV</button>
+        </div>
       </div>
       <div class="table-wrap">
         <table>
@@ -811,12 +842,16 @@ function renderSection(){
         ?`<div class="overall-box"><div class="section-title">Overall</div><div class="overall-grid" id="overallGrid"></div></div>`
         :`<div class="grand-total-box"><div><div class="grand-label">GRAND TOTAL (Paid)</div><div style="font-size:0.65rem;color:var(--muted);margin-top:2px">Excludes unpaid</div></div><div class="grand-value" id="grandTotal">₱ 0.00</div></div>`
       }
-      <div id="unpaidBox" style="margin-top:10px;padding:10px 14px;background:rgba(248,113,113,0.08);border:1px solid rgba(248,113,113,0.25);border-radius:10px;display:flex;justify-content:space-between;align-items:center;">
-        <div>
-          <span style="font-size:0.65rem;color:var(--unpaid);text-transform:uppercase;letter-spacing:1px;display:block;">Total Unpaid</span>
-          <span class="unpaid-sub" style="font-size:0.68rem;color:var(--muted);">0 entries · 0 units</span>
+      <div id="unpaidBox" style="margin-top:10px;background:rgba(248,113,113,0.06);border:1px solid rgba(248,113,113,0.25);border-radius:10px;padding:12px 14px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+          <span style="font-size:0.65rem;color:var(--unpaid);text-transform:uppercase;letter-spacing:1px;font-weight:700;">⚠ Unpaid Breakdown</span>
+          <span id="totalUnpaid" style="font-family:'Syne',sans-serif;font-size:1.1rem;font-weight:800;color:var(--unpaid)">₱0.00</span>
         </div>
-        <span id="totalUnpaid" style="font-family:'Syne',sans-serif;font-size:1.1rem;font-weight:800;color:var(--unpaid)">₱0.00</span>
+        <div id="unpaidBreakdown" style="display:flex;flex-wrap:wrap;gap:6px;"></div>
+        <div style="display:flex;justify-content:space-between;margin-top:8px;padding-top:6px;border-top:1px solid rgba(248,113,113,0.2);">
+          <span class="unpaid-sub" style="font-size:0.68rem;color:var(--muted);">0 entries · 0 units</span>
+          <span class="unpaid-comm-line" style="font-size:0.68rem;color:var(--commission);display:none;"></span>
+        </div>
       </div>
     </div>`;
 
@@ -844,9 +879,8 @@ function onCatChange(init){
     buildChips(chips,def.vals.map(p=>({label:'₱'+p,val:p})),priceIn);
     priceIn.value=def.vals[0];chips.querySelector('.chip').classList.add('active');
   } else if(def.type==='options'){
-    // label already contains the display text (e.g. "30", "Gallon only")
-    // Don't append ₱val again — that caused "20 peso20" style bugs
-    buildChips(chips,def.opts.map(o=>({label:'₱'+o.val+' '+o.label,val:o.val})),priceIn);
+    // If label is purely numeric and equals val, just show ₱val (avoid "₱40 40")
+    buildChips(chips,def.opts.map(o=>({label:(String(o.label).trim()===String(o.val).trim()||/^\d+(\.\d+)?$/.test(String(o.label).trim()))?'₱'+o.val:'₱'+o.val+' '+o.label,val:o.val})),priceIn);
     priceIn.value=def.opts[0].val;chips.querySelector('.chip').classList.add('active');
   }
   calcTotal();
@@ -856,11 +890,47 @@ function buildChips(container,opts,input){
   opts.forEach(o=>{
     const c=document.createElement('button');
     c.className='chip';c.type='button';c.dataset.val=o.val;c.textContent=o.label;
-    c.onclick=()=>{container.querySelectorAll('.chip').forEach(x=>x.classList.remove('active'));c.classList.add('active');input.value=o.val;calcTotal();};
+    c.onclick=()=>{
+      container.querySelectorAll('.chip').forEach(x=>x.classList.remove('active'));
+      c.classList.add('active');input.value=o.val;calcTotal();
+      // Reset custom price button style
+      const cb=document.getElementById('customPriceBtn');
+      if(cb){cb.style.borderColor='';cb.style.color='';}
+    };
     container.appendChild(c);
   });
 }
 
+function enableCustomPrice(){
+  const priceIn=document.getElementById('price');
+  const chips=document.getElementById('priceChips');
+  if(!priceIn)return;
+  priceIn.readOnly=false;priceIn.value='';
+  if(chips)chips.querySelectorAll('.chip').forEach(c=>c.classList.remove('active'));
+  priceIn.focus();
+  const btn=document.getElementById('customPriceBtn');
+  if(btn){btn.style.borderColor='var(--accent)';btn.style.color='var(--accent)';}
+}
+function enableEditCustomPrice(){
+  const priceIn=document.getElementById('ePrice');
+  const chips=document.getElementById('eChips');
+  if(!priceIn)return;
+  priceIn.readOnly=false;priceIn.value='';
+  if(chips)chips.querySelectorAll('.chip').forEach(c=>c.classList.remove('active'));
+  priceIn.focus();
+}
+function toggleOthersChip(btn){
+  const sub=document.getElementById('othersSubOpts');
+  if(!sub)return;
+  const isOpen=sub.style.display==='flex';
+  if(isOpen){sub.style.display='none';btn.classList.remove('active');document.getElementById('custName').value='';}
+  else{sub.style.display='flex';btn.classList.add('active');document.getElementById('custName').value='';}
+}
+function setOthersSubActive(el){
+  const sub=document.getElementById('othersSubOpts');
+  if(sub)sub.querySelectorAll('.chip').forEach(c=>c.classList.remove('active'));
+  el.classList.add('active');
+}
 function calcTotal(){
   const qty=parseFloat(document.getElementById('qty')?.value)||0;
   const price=parseFloat(document.getElementById('price')?.value)||0;
@@ -964,6 +1034,21 @@ function renderTable(){
   }).join('');
 }
 
+// Real-time search filter — operates on existing DOM rows, no re-render
+function filterTable(){
+  const q=(document.getElementById('searchBar')?.value||'').toLowerCase().trim();
+  const tbody=document.getElementById('entriesBody');
+  if(!tbody)return;
+  const rows=tbody.querySelectorAll('tr');
+  rows.forEach(tr=>{
+    if(tr.classList.contains('empty-row')){tr.style.display='';return;}
+    // Name is in 3rd td (index 2)
+    const nameTd=tr.querySelectorAll('td')[2];
+    const name=nameTd?nameTd.textContent.toLowerCase():'';
+    tr.style.display=(q===''||name.includes(q))?'':'none';
+  });
+}
+
 // Toggle between Paid ↔ No Payment instantly
 function togglePay(id){
   const entry=getActive().entries.find(e=>e.id===id);
@@ -979,31 +1064,69 @@ function renderSummary(){
   const grid=document.getElementById('summaryGrid');
   if(!grid)return;
   let grandTotal=0,totalGals=0,totalSales=0,totalComm=0;
+  let totalUnpaidComm=0;
   const items=cats.map(cat=>{
     const rows=sec.entries.filter(e=>e.cat===cat);if(!rows.length)return'';
     const paidRows=rows.filter(e=>e.payment==='Paid');
-    const qty=rows.reduce((s,e)=>s+e.qty,0);
+    const unpaidRows=rows.filter(e=>e.payment!=='Paid');
+    const paidQty=paidRows.reduce((s,e)=>s+e.qty,0);
+    const unpaidQty=unpaidRows.reduce((s,e)=>s+e.qty,0);
+    const totalQty=rows.reduce((s,e)=>s+e.qty,0);
     const amt=paidRows.reduce((s,e)=>s+e.total,0);
     const comm=paidRows.reduce((s,e)=>s+(e.commission||0),0);
-    grandTotal+=amt;totalGals+=paidRows.reduce((s,e)=>s+e.qty,0);totalSales+=amt;totalComm+=comm;
-    return`<div class="sum-item"><div class="sum-cat">${CAT_LABELS[cat]}</div><div class="sum-qty">${qty} unit${qty!==1?'s':''}</div><div class="sum-total">₱${amt.toFixed(2)}</div>${isDel?`<div class="sum-commission">Commission: ₱${comm.toFixed(2)}</div>`:''}</div>`;
+    const unpaidComm2=unpaidRows.reduce((s,e)=>s+(e.commission||0),0);
+    grandTotal+=amt;totalGals+=paidQty;totalSales+=amt;totalComm+=comm;
+    totalUnpaidComm+=unpaidComm2;
+    const countDisp=unpaidRows.length>0
+      ?`<span style="color:var(--paid)">${paidQty}</span> + <span style="color:var(--unpaid)">${unpaidQty}</span>`
+      :`${totalQty}`;
+    return`<div class="sum-item"><div class="sum-cat">${CAT_LABELS[cat]}</div><div class="sum-qty">${countDisp} unit${totalQty!==1?'s':''}</div><div class="sum-total">₱${amt.toFixed(2)}</div>${isDel?`<div class="sum-commission">Commission: ₱${comm.toFixed(2)}</div>`:''}</div>`;
   });
+  grid.innerHTML=items.join('');
+
+  // ── Unpaid box: per-category breakdown ──────────────────────────────────────
   const unpaid=sec.entries.filter(e=>e.payment!=='Paid');
   const unpaidAmt=unpaid.reduce((s,e)=>s+e.total,0);
   const unpaidGals=unpaid.reduce((s,e)=>s+e.qty,0);
+  const unpaidComm=unpaid.reduce((s,e)=>s+(e.commission||0),0);
+
   const tuEl=document.getElementById('totalUnpaid');
   if(tuEl)tuEl.textContent='₱'+unpaidAmt.toFixed(2);
+
   const unpaidBox=document.getElementById('unpaidBox');
   if(unpaidBox){
-    unpaidBox.style.display=unpaid.length?'flex':'flex';
+    // Per-category breakdown chips
+    const breakdownEl=document.getElementById('unpaidBreakdown');
+    if(breakdownEl){
+      if(unpaid.length===0){
+        breakdownEl.innerHTML=`<span style="font-size:0.72rem;color:var(--muted);font-style:italic;">No unpaid entries</span>`;
+      } else {
+        // Group unpaid by category
+        const catMap={};
+        unpaid.forEach(e=>{
+          if(!catMap[e.cat]){catMap[e.cat]={qty:0,amt:0,comm:0};}
+          catMap[e.cat].qty+=e.qty;
+          catMap[e.cat].amt+=e.total;
+          catMap[e.cat].comm+=(e.commission||0);
+        });
+        breakdownEl.innerHTML=Object.entries(catMap).map(([cat,v])=>`
+          <div style="background:rgba(248,113,113,0.1);border:1px solid rgba(248,113,113,0.25);border-radius:7px;padding:5px 9px;min-width:90px;">
+            <div style="font-size:0.58rem;color:var(--unpaid);text-transform:uppercase;letter-spacing:0.7px;margin-bottom:2px;">${CAT_LABELS[cat]||cat}</div>
+            <div style="font-size:0.78rem;font-weight:700;color:var(--text);">${v.qty} unit${v.qty!==1?'s':''}</div>
+            <div style="font-size:0.68rem;color:var(--unpaid);">₱${v.amt.toFixed(2)}</div>
+            ${isDel&&v.comm>0?`<div style="font-size:0.62rem;color:var(--commission);">Comm: ₱${v.comm.toFixed(2)}</div>`:''}
+          </div>`).join('');
+      }
+    }
     const subEl=unpaidBox.querySelector('.unpaid-sub');
     if(subEl)subEl.textContent=`${unpaid.length} entr${unpaid.length!==1?'ies':'y'} · ${unpaidGals} unit${unpaidGals!==1?'s':''}`;
+    const commLineEl=unpaidBox.querySelector('.unpaid-comm-line');
+    if(commLineEl){
+      if(isDel&&unpaidComm>0){commLineEl.style.display='';commLineEl.textContent=`Commission: ₱${unpaidComm.toFixed(2)}`;}
+      else{commLineEl.style.display='none';}
+    }
   }
-  if(unpaid.length){
-    const ua=unpaidAmt;
-    items.push(`<div class="sum-item" style="border-color:rgba(248,113,113,0.3)"><div class="sum-cat" style="color:var(--unpaid)">Unpaid</div><div class="sum-qty">${unpaid.length} entr${unpaid.length!==1?'ies':'y'} · ${unpaidGals} unit${unpaidGals!==1?'s':''}</div><div class="sum-total" style="color:var(--unpaid)">₱${ua.toFixed(2)}</div></div>`);
-  }
-  grid.innerHTML=items.join('');
+
   if(!isDel){
     const gt=document.getElementById('grandTotal');if(gt)gt.textContent='₱'+grandTotal.toFixed(2);
   } else {
@@ -1058,7 +1181,7 @@ function onEditCatChange(currentPrice){
   const def=cat_db[cat];if(!def){calcEditTotal();return;}
   if(def.type==='fixed'){buildChipsModal(chips,[{label:'₱'+def.val,val:def.val}],priceIn);priceIn.value=currentPrice??def.val;priceIn.readOnly=true;}
   else if(def.type==='range'){buildChipsModal(chips,def.vals.map(p=>({label:'₱'+p,val:p})),priceIn);if(currentPrice==null)priceIn.value=def.vals[0];}
-  else if(def.type==='options'){buildChipsModal(chips,def.opts.map(o=>({label:'₱'+o.val+' '+o.label,val:o.val})),priceIn);if(currentPrice==null)priceIn.value=def.opts[0].val;}
+  else if(def.type==='options'){buildChipsModal(chips,def.opts.map(o=>({label:(String(o.label).trim()===String(o.val).trim()||/^\d+(\.\d+)?$/.test(String(o.label).trim()))?'₱'+o.val:'₱'+o.val+' '+o.label,val:o.val})),priceIn);if(currentPrice==null)priceIn.value=def.opts[0].val;}
   const av=parseFloat(priceIn.value);
   chips.querySelectorAll('.chip').forEach(c=>{if(parseFloat(c.dataset.val)===av)c.classList.add('active');});
   calcEditTotal();
@@ -1211,6 +1334,9 @@ window.exportPastDateCSV=exportPastDateCSV;window.clearSection=clearSection;
 window.confirmAddSection=confirmAddSection;window.switchSection=switchSection;
 window.openPastDate=openPastDate;
 window.toggleSpecial=toggleSpecial;window.toggleEditSpecial=toggleEditSpecial;
+window.toggleOthersChip=toggleOthersChip;window.setOthersSubActive=setOthersSubActive;
+window.enableCustomPrice=enableCustomPrice;window.enableEditCustomPrice=enableEditCustomPrice;
+window.filterTable=filterTable;
 
 window.addEventListener('beforeunload',()=>{
   if(_unsubscribe)_unsubscribe();
@@ -1221,3 +1347,4 @@ init();
 </script>
 </body>
 </html>
+
